@@ -1,0 +1,525 @@
+---
+title: "Load Dataset"
+author: "Jiashu Liu"
+date: "4/12/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, error=TRUE, message=FALSE, warning=FALSE)
+```
+
+## R Markdown
+
+```{r}
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(ggplot2)
+library(geeM)
+# packages for map
+library(rjson)
+library(geojsonsf)
+library(sf)
+#library(tidymodels)
+#library(probably) #install.packages('probably')
+library(rpart.plot)
+#tidymodels_prefer()
+
+library(stringr)
+#install.packages('sf')
+library(spdep) #install.packages('spdep')
+library(rsample)#vfold_cv
+library(parsnip)
+library(recipes)
+library(workflows)
+library(dials)
+library(tune)
+library(yardstick)
+```
+
+## Load data
+
+```{r}
+crime <- read_csv("Crime_Incident_Report.csv")
+
+saintpaul <- read_csv("2019_neighborhood_new.csv")
+
+temperature <- read_csv("2019 St.Paul Monthly Temp.csv")
+
+```
+
+
+## Cleaning dataset
+
+```{r}
+crimedataset <- crime %>% 
+  filter(year(DATE) == 2019)
+
+crimedataset <- crimedataset %>% 
+  mutate(incident_cat = ifelse(str_detect(INCIDENT, "Theft")|INCIDENT %in% c("Burglary") , "Theft",INCIDENT)) %>% 
+  mutate(incident_cat = ifelse(str_detect(INCIDENT, "Assault")|INCIDENT %in% c("Arson","Rape","Homicide","Simple Asasult Dom.", "Criminal Damage", "Robbery"), "Violence",incident_cat)) %>% 
+  # other: no people hurt
+  mutate(incident_cat = ifelse(INCIDENT %in% c("Graffiti" ,"Vandalism"), "Property Damage", incident_cat)) %>%
+  mutate(incident_cat = ifelse(INCIDENT %in% c("Narcotics","Discharge"), "Other", incident_cat)) %>% 
+  mutate(incident_cat = ifelse(INCIDENT %in% c("Community Engagement Event", "Proactive Police Visit"), "Police Presences", incident_cat))
+
+crimedataset <- crimedataset %>%
+  mutate(month = month(DATE)) %>%
+  group_by(NEIGHBORHOOD_NUMBER, month,incident_cat) %>% 
+  summarise(inc_count = n(),NEIGHBORHOOD_NUMBER,incident_cat,.groups = "drop") %>% 
+  distinct() %>% 
+  complete(NEIGHBORHOOD_NUMBER,month,incident_cat,fill = list(inc_count = 0)) %>% 
+  
+  left_join(saintpaul, by = c("NEIGHBORHOOD_NUMBER" = "Neighorhood_Code")) %>% 
+  mutate(count_per_10000_people = inc_count/`Total population`*10000) %>% 
+  mutate(Neighborhood = ifelse(Neighborhood == "Como (St. Paul)", "Como Park",Neighborhood),
+         Neighborhood = ifelse(Neighborhood == "Frogtown/Thomas-Dale", "Frogtown",Neighborhood),
+         Neighborhood = ifelse(Neighborhood == "St. Anthony Park", "St. Anthony",Neighborhood),
+         Neighborhood = ifelse(Neighborhood == "Battle Creek-Highwood", "Southeast",Neighborhood))
+
+```
+
+
+### filter theft data and violence data
+```{r} 
+theftdata <- crimedataset %>% 
+  filter(incident_cat == "Theft") %>% 
+  pivot_longer(cols= `Male - Share` : `Poverty 65 years and older - Share`, names_to = "variables", values_to = "values") %>% 
+  mutate(values = as.numeric(str_remove(values, "%"))) %>% 
+  pivot_wider(names_from = variables, values_from = values)
+
+violencedata <- crimedataset %>% 
+  filter(incident_cat == "Violence") %>% 
+  pivot_longer(cols= `Male - Share` :`Poverty 65 years and older - Share`,names_to = "variables", values_to = "values") %>% 
+  mutate(values = as.numeric(str_remove(values, "%"))) %>% 
+  pivot_wider(names_from = variables, values_from = values)
+```
+
+# Create 10 CV folds
+```{r}
+train_cv <- vfold_cv(theftdata, v = 10)
+train_cv2 <- vfold_cv(violencedata, v = 10)
+```
+
+## LASSO
+
+### Model Specification
+```{r}
+lm_lasso_spec_tune <- 
+  linear_reg() %>%
+  set_args(mixture = 1, penalty = tune()) %>% 
+  set_engine(engine = 'glmnet') %>%
+  set_mode('regression')
+```
+
+### Recipe & Workflow
+```{r}
+lasso_rec <- recipe( `count_per_10000_people` ~ ., data = theftdata) %>% 
+    step_rm(`NEIGHBORHOOD_NUMBER`) %>%
+    step_rm(`Neighborhood`) %>%
+    step_rm(`inc_count`) %>%
+    step_rm(`incident_cat`) %>%
+    step_rm(`Of Color - Share`) %>%
+    step_nzv(all_predictors()) %>%
+    step_other(all_nominal_predictors()) %>%
+    step_dummy(all_nominal_predictors()) %>% 
+    step_normalize(all_numeric_predictors())  # important step for LASSO
+
+lasso_wf1 <- workflow() %>%
+    add_recipe(lasso_rec) %>%
+    add_model(lm_lasso_spec_tune)
+
+```
+
+### Fit & Tune Models
+```{r}
+#Lasso
+penalty_grid <- grid_regular(
+  penalty(range = c(-4, 4)), #log10 transformed 
+  levels = 30)
+
+tune_output1 <- tune_grid( # new function for tuning hyperparameters
+  lasso_wf1, # workflow
+  resamples = train_cv, # cv folds
+  metrics = metric_set(rmse, mae),
+  grid = penalty_grid # penalty grid defined above
+)
+
+best_penalty1 <- select_by_one_std_err(tune_output1, metric = 'mae',desc(penalty)) # choose penalty value based on the largest penalty within 1 se of the lowest CV MAE
+
+final_lasso_wf1 <- finalize_workflow(lasso_wf1, best_penalty1)
+final_lasso_fit1 <- fit(final_lasso_wf1, data = theftdata)
+tidy(final_lasso_fit1) 
+```
+
+### Visualize Model Evaluation Metrics from Tuning
+```{r}
+autoplot(tune_output1) + theme_classic()
+```
+
+
+### Variable Importance
+```{r}
+glmnet_output <- final_lasso_fit1 %>% extract_fit_engine()
+
+lambdas <- glmnet_output$lambda
+coefs_lambdas <- 
+  coefficients(glmnet_output, s = lambdas )  %>% 
+  as.matrix() %>%  
+  t() %>% 
+  as.data.frame() %>% 
+  mutate(lambda = lambdas ) %>% 
+  select(lambda, everything(), -`(Intercept)`) %>% 
+  pivot_longer(cols = -lambda, 
+               names_to = "term", 
+               values_to = "coef") %>%
+  mutate(var = purrr::map_chr(stringr::str_split(term,"_"),~.[1]))
+
+coefs_lambdas %>%
+  ggplot(aes(x = lambda, y = coef, color = var)) +
+  geom_line() +
+  #geom_vline(xintercept = best_se_penalty %>% pull(penalty), linetype = 'dashed') + 
+  theme_classic() + 
+  theme(legend.position = "bottom", legend.text=element_text(size=8))
+    
+# Create a boolean matrix (predictors x lambdas) of variable exclusion
+bool_predictor_exclude <- glmnet_output$beta==0
+
+# Loop over each variable
+var_imp <- sapply(seq_len(nrow(bool_predictor_exclude)), function(row) {
+    this_coeff_path <- bool_predictor_exclude[row,]
+    if(sum(this_coeff_path) == ncol(bool_predictor_exclude)){ return(0)}else{
+    return(ncol(bool_predictor_exclude) - which.min(this_coeff_path) + 1)}
+})
+
+# Create a dataset of this information and sort
+var_imp_data <- tibble(
+    var_name = rownames(bool_predictor_exclude),
+    var_imp = var_imp
+)
+
+var_imp_data %>% arrange(desc(var_imp))
+```
+
+
+
+```{r}
+lasso_rec2 <- recipe( `count_per_10000_people` ~ ., data = violencedata) %>% 
+    step_rm(`NEIGHBORHOOD_NUMBER`) %>%
+    step_rm(`Neighborhood`) %>%
+    step_rm(`inc_count`) %>%
+    step_nzv(all_predictors()) %>%
+    step_other(all_nominal_predictors()) %>%
+    step_dummy(all_nominal_predictors()) %>% 
+    step_normalize(all_numeric_predictors())  # important step for LASSO
+
+lasso_wf2 <- workflow() %>%
+    add_recipe(lasso_rec2) %>%
+    add_model(lm_lasso_spec_tune)
+```
+
+```{r}
+#Lasso
+penalty_grid <- grid_regular(
+  penalty(range = c(-4, 4)), #log10 transformed 
+  levels = 30)
+
+tune_output2 <- tune_grid( # new function for tuning hyperparameters
+  lasso_wf2, # workflow
+  resamples = train_cv2, # cv folds
+  metrics = metric_set(rmse, mae),
+  grid = penalty_grid # penalty grid defined above
+)
+
+best_penalty2 <- select_by_one_std_err(tune_output2, metric = 'mae',desc(penalty)) # choose penalty value based on the largest penalty within 1 se of the lowest CV MAE
+
+final_lasso_wf2 <- finalize_workflow(lasso_wf2, best_penalty2)
+final_lasso_fit2 <- fit(final_lasso_wf2, data = violencedata)
+tidy(final_lasso_fit2) 
+```
+
+```{r}
+autoplot(tune_output2) + theme_classic()
+```
+
+```{r}
+glmnet_output2 <- final_lasso_fit2 %>% extract_fit_engine()
+    
+# Create a boolean matrix (predictors x lambdas) of variable exclusion
+bool_predictor_exclude2 <- glmnet_output2$beta==0
+
+# Loop over each variable
+var_imp2 <- sapply(seq_len(nrow(bool_predictor_exclude2)), function(row) {
+    this_coeff_path2 <- bool_predictor_exclude2[row,]
+    if(sum(this_coeff_path2) == ncol(bool_predictor_exclude2)){ return(0)}else{
+    return(ncol(bool_predictor_exclude2) - which.min(this_coeff_path2) + 1)}
+})
+
+# Create a dataset of this information and sort
+var_imp_data2 <- tibble(
+    var_name = rownames(bool_predictor_exclude2),
+    var_imp2 = var_imp2
+)
+
+var_imp_data2 %>% arrange(desc(var_imp2))
+```
+## GEE Modeling
+
+### Violence
+```{r}
+violencedata <-  violencedata %>% 
+  mutate(ue_percentage = `Unemployment rate - Share`) %>% 
+  mutate(white_more_than_70 = factor(if_else(`White - Share` > 70, "Yes",'No'))) %>%
+  mutate(BA_percentage = `Bachelor's degree or higher - Share`) %>%
+  mutate(black_percentage = `Black or African American - Share`,
+         black = ifelse(black_percentage <= 10, "Less than 10%", NA),
+         black = ifelse(black_percentage >10 & black_percentage <= 20, "Between 10% & 20%",black),
+         black = ifelse(black_percentage > 20, "More than 20%", black)) %>% 
+  #mutate(black = relevel(black, ref = 'Less than 10%')) %>%
+  mutate(asian_more_than_25 = factor(if_else(`Asian or Pacific Islander - Share` > 25, "Yes",'No')))  %>%
+  mutate(Native_percentage = `American Indian and Alaska Native - Share`) %>%
+  mutate(Latino_percentage = `Hispanic or Latino - Share`) %>%
+  mutate(Median_household_income = `Median household income (2008-2012, 2012 dollars)`) %>%
+  mutate(Poverty_17_and_younger = `Poverty 17 years and younger - Share`) 
+
+
+gee_violence <- violencedata %>%
+  geem(count_per_10000_people ~ factor(month) + Native_percentage + white_more_than_70 + BA_percentage + Poverty_17_and_younger + `Male - Share` + `Population with a disability - Share`, data = ., id = Neighborhood, corstr = "ar1")
+
+summary(gee_violence)
+
+```
+
+
+```{r}
+map <- geojson_sf("TwinCities Final.json",expand_geometries = TRUE) %>% 
+  mutate(name2 = ifelse(name2 == "Frogtown/Thomas-Dale", "Frogtown",name2),
+         name2 = ifelse(name2 == "Highland Park", "Highland",name2),
+         name2 = ifelse(name2 == "St Anthony Park", "St. Anthony",name2),
+         name2 = ifelse(name2 == "West 7th - Fort Road", "West Seventh",name2))
+  
+
+
+mapdata <- violencedata %>% 
+  group_by(Neighborhood) %>% 
+  summarise(year_count_per1000 = sum(count_per_10000_people),.groups = "drop") %>%
+  distinct() %>% 
+  left_join(map, by = c("Neighborhood"="name2"))
+
+violencedata$pred <- predict(gee_violence)
+violencedata$resid <- violencedata$count_per_10000_people-violencedata$pred
+
+violencedata %>% 
+  left_join(map, by = c("Neighborhood"="name2"))  %>% 
+  ggplot() +
+  geom_sf(aes(geometry = geometry,fill = resid)) +
+  scale_fill_gradient2(mid = "white", high = "red", low = "blue") +
+  facet_wrap(~month)+
+  labs(title = "Residual Plot-Violence")+
+  theme_void()
+```
+
+
+```{r}
+violence <- violencedata %>% 
+  group_by(Neighborhood) %>% 
+  summarise(year_count_per10000 = sum(count_per_10000_people), `Unemployment rate - Share`, .groups = "drop") %>%
+  distinct() %>% 
+  left_join(map, by = c("Neighborhood"="name2")) 
+
+write.csv2(violence, file = "Map.csv")
+
+stpaul_centroids <- st_centroid(st_geometry(mapdata$geometry), of_largest_polygon = TRUE)
+
+KNN <- knn2nb(knearneigh(stpaul_centroids, k = 3))
+
+nb_KNN_net <- nb2lines(nb = KNN, coords = stpaul_centroids, as_sf = TRUE)
+
+Ww_KNN <- nb2listw(KNN, style = "W")
+
+ROOK <- poly2nb(mapdata$geometry,queen = FALSE)
+
+nb_R_net <- nb2lines(nb = ROOK, coords = stpaul_centroids, as_sf = TRUE)
+
+Ww_ROOK <- nb2listw(ROOK, style = "W")
+
+moranI <- pvalue <- rep(NA, 12)    
+for(i in 1:12){  
+  foo <-violencedata %>% 
+  left_join(map, by = c("Neighborhood"="name2")) %>% 
+  filter(month == i) %>% pull(resid) %>%
+spdep::moran.test(., Ww_ROOK, alternative = "two.sided", randomisation = TRUE)  # Using randomization test
+moranI[i] <- foo$estimate[1]
+pvalue[i] <- foo$p.value
+}
+
+ROOK <- data.frame(month=1:12, moranI, pvalue,NB = 'Rook')
+
+moranI <- pvalue <- rep(NA, 12)    
+for(i in 1:12){  
+  foo <-violencedata %>% 
+  left_join(map, by = c("Neighborhood"="name2")) %>% 
+  filter(month == i) %>% pull(resid) %>%
+spdep::moran.test(., Ww_KNN, alternative = "two.sided", randomisation = TRUE)  # Using randomization test
+moranI[i] <- foo$estimate[1]
+pvalue[i] <- foo$p.value
+}
+
+
+KNN <- data.frame(month=1:12, moranI, pvalue,NB = 'KNN')
+
+
+mor <- rbind(ROOK,KNN)
+
+mor %>% 
+  ggplot(aes(x = month, y = moranI, color = NB))+
+  geom_point()+
+  geom_line()
+```
+
+
+### theft
+
+```{r}
+theftdata <- theftdata %>% 
+  mutate(ue_percentage = `Unemployment rate - Share`) %>% 
+  mutate(ue_more_than_5 = factor(if_else(ue_percentage > 5, "Yes",'No'))) %>% 
+  mutate(BA_percentage = `Bachelor's degree or higher - Share`,
+         Bachelor = ifelse(BA_percentage <= 40, "Less than 40%", NA),
+         Bachelor = ifelse(BA_percentage >40 & BA_percentage <= 60, "Between 40% & 60%",Bachelor),
+         Bachelor = ifelse(BA_percentage > 60, "More than 60%", Bachelor)) %>%
+  mutate(black_percentage = as.numeric(str_remove(`Black or African American - Share`, "%"))) %>%
+  mutate(black_more_than_20 = factor(if_else(black_percentage > 20, "Yes",'No'))) %>% 
+  mutate(male_more_50 = factor(if_else(`Male - Share` > 50, "Yes",'No'))) %>%
+  mutate(college_age_more_15 = factor(if_else(`18-24 years - Share` > 15, "Yes",'No'))) %>% 
+  mutate(Median_household_income = `Median household income (2008-2012, 2012 dollars)`) %>%
+  mutate(household_income_more_60000 = factor(if_else(Median_household_income > 60000, "Yes",'No'))) %>% 
+  mutate(Asian_percentage = as.numeric(str_remove(`Asian or Pacific Islander - Share`, "%"))) %>%
+  mutate(asian_more_than_20 = factor(if_else(Asian_percentage > 20, "Yes",'No'))) %>%
+  mutate(Native_percentage = as.numeric(str_remove(`American Indian and Alaska Native - Share`, "%"))) %>%
+   mutate(native = ifelse(Native_percentage > 0.8, "More than 0.8%","Between 0.4% and 0.8%"),
+         native = ifelse(Native_percentage < 0.45, "Less than 0.45%",native)) %>%
+  mutate(unemployment = ifelse(ue_percentage < 4, "Less than 4%","Between 4% and 6%"),
+         unemployment = ifelse(ue_percentage > 6, "More than 6%",unemployment)) %>%
+  mutate(white_percentage = `White - Share`) %>%
+  mutate(white_more_60 = factor(if_else(white_percentage > 60, "Yes",'No')))
+
+
+gee_theft <- theftdata %>%
+  geem(count_per_10000_people ~ factor(month) + college_age_more_15 + white_more_60 + `Owner-occupied - Share` + `Median rent (2008-2012, 2012 dollars)`, data = ., id = Neighborhood, corstr = "ar1")
+
+summary(gee_theft)
+
+
+```
+
+
+```{r}
+map <- geojson_sf("TwinCities Final.json",expand_geometries = TRUE) %>% 
+  mutate(name2 = ifelse(name2 == "Frogtown/Thomas-Dale", "Frogtown",name2),
+         name2 = ifelse(name2 == "Highland Park", "Highland",name2),
+         name2 = ifelse(name2 == "St Anthony Park", "St. Anthony",name2),
+         name2 = ifelse(name2 == "West 7th - Fort Road", "West Seventh",name2))
+  
+
+
+mapdata <- theftdata %>% 
+  group_by(Neighborhood) %>% 
+  summarise(year_count_per1000 = sum(count_per_10000_people),.groups = "drop") %>%
+  distinct() %>% 
+  left_join(map, by = c("Neighborhood"="name2"))
+theftdata$pred <- predict(gee_theft)
+theftdata$resid <- theftdata$count_per_10000_people-theftdata$pred
+
+theftdata %>% 
+  left_join(map, by = c("Neighborhood"="name2"))  %>% 
+  ggplot() +
+  geom_sf(aes(geometry = geometry,fill = resid)) +
+  scale_fill_gradient2(mid = "white", high = "red", low = "blue") +
+  facet_wrap(~month)+
+  labs(title = "Residual Plot-Theft")+
+  theme_void()
+
+stpaul_centroids <- st_centroid(st_geometry(mapdata$geometry), of_largest_polygon = TRUE)
+
+KNN <- knn2nb(knearneigh(stpaul_centroids, k = 3))
+
+nb_KNN_net <- nb2lines(nb = KNN, coords = stpaul_centroids, as_sf = TRUE)
+
+Ww_KNN <- nb2listw(KNN, style = "W")
+
+ROOK <- poly2nb(mapdata$geometry,queen = FALSE)
+
+nb_R_net <- nb2lines(nb = ROOK, coords = stpaul_centroids, as_sf = TRUE)
+
+Ww_ROOK <- nb2listw(ROOK, style = "W")
+
+moranI <- pvalue <- rep(NA, 12)    
+for(i in 1:12){  
+  foo <-theftdata %>% 
+  left_join(map, by = c("Neighborhood"="name2")) %>% 
+  filter(month == i) %>% pull(resid) %>%
+spdep::moran.test(., Ww_ROOK, alternative = "two.sided", randomisation = TRUE)  # Using randomization test
+moranI[i] <- foo$estimate[1]
+pvalue[i] <- foo$p.value
+}
+
+ROOK <- data.frame(month=1:12, moranI, pvalue,NB = 'Rook')
+
+
+moranI <- pvalue <- rep(NA, 12)    
+for(i in 1:12){  
+  foo <-theftdata %>% 
+  left_join(map, by = c("Neighborhood"="name2")) %>% 
+  filter(month == i) %>% pull(resid) %>%
+spdep::moran.test(., Ww_KNN, alternative = "two.sided", randomisation = TRUE)  # Using randomization test
+moranI[i] <- foo$estimate[1]
+pvalue[i] <- foo$p.value
+}
+
+KNN <- data.frame(month=1:12, moranI, pvalue,NB = 'KNN')
+
+
+mor <- rbind(ROOK,KNN)
+
+mor %>% 
+  ggplot(aes(x = month, y = moranI, color = NB))+
+  geom_point()+
+  geom_line()
+```
+
+
+### Spatial
+
+```{r}
+stpaul_centroids <- st_centroid(st_geometry(mapdata$geometry), of_largest_polygon = TRUE)
+
+Rock <- poly2nb(mapdata$geometry,queen = FALSE)
+
+nb_R_net <- nb2lines(nb = Rock, coords = stpaul_centroids, as_sf = TRUE)
+
+KNN <- knn2nb(knearneigh(stpaul_centroids, k = 3))
+
+nb_KNN_net <- nb2lines(nb = KNN, coords = stpaul_centroids, as_sf = TRUE)
+
+stpaul_centroids %>%
+  ggplot() + geom_sf() + 
+  geom_sf(data = mapdata,aes(geometry = geometry)) + 
+  geom_sf(data = nb_R_net)+
+  scale_fill_gradient(high = "pink", low = "white") +
+  scale_size_continuous(range = c(2,10))+
+  theme_void()+
+  labs(title = "ROOK")
+
+stpaul_centroids %>%
+  ggplot() + geom_sf() + 
+  geom_sf(data = mapdata,aes(geometry = geometry)) + 
+  geom_sf(data = nb_KNN_net)+
+  scale_fill_gradient(high = "pink", low = "white") +
+  scale_size_continuous(range = c(2,10))+
+  theme_void()+
+  labs(title = "KNN n=3")
+```
+
